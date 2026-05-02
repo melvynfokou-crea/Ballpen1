@@ -1,15 +1,15 @@
 """
-ballpen_production_line.py
-==========================
-A teaching example: simulate a ball-pen production line in Python.
+prod.py
+=======
+Ball-pen production line.  Supports two pen variants that share the same
+four components (barrel, tip, cartridge, cap) but differ in tip quality:
 
-Concepts demonstrated:
-- Dataclasses for plain data (components, pens)
-- Enums for fixed sets of states
-- Abstract base classes (ABCs) for a common station interface
-- Composition: a ProductionLine is built from Stations
-- Queues to pass work between stations
-- Simple statistics / quality control with randomness
+  PenType.STANDARD  — regular tip   (higher defect rate: 10 %)
+  PenType.PREMIUM   — premium tip   (lower  defect rate:  2 %)
+
+Backward-compatible with hmi.py:
+  • ProductionLine.COMPONENT_NAMES is still a class attribute
+  • AssemblyStation.process(parts) still works (pen_type defaults to STANDARD)
 """
 
 from __future__ import annotations
@@ -19,80 +19,75 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Deque, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
-# 1. Domain model: what *is* a ball pen?
+# 1. Domain model
 # ---------------------------------------------------------------------------
 
 class Quality(Enum):
-    """Quality grade assigned by inspection stations."""
-    OK = auto()
+    OK        = auto()
     DEFECTIVE = auto()
+
+
+class PenType(Enum):
+    STANDARD = "Standard"   # regular tip
+    PREMIUM  = "Premium"    # premium tip
+
+
+# Both variants use the same four components.
+COMPONENT_NAMES: Tuple[str, ...] = ("barrel", "tip", "cartridge", "cap")
+
+# Only the tip defect rate differs between variants.
+TIP_DEFECT_RATE: Dict[PenType, float] = {
+    PenType.STANDARD: 0.10,
+    PenType.PREMIUM:  0.02,
+}
 
 
 @dataclass
 class Component:
-    """A generic part that goes into a pen (barrel, tip, cartridge, cap)."""
-    name: str
-    serial: int
+    name:    str
+    serial:  int
     quality: Quality = Quality.OK
 
 
 @dataclass
 class BallPen:
-    """Finished or in-progress pen: a composition of components."""
-    serial: int
-    barrel: Optional[Component] = None
-    tip: Optional[Component] = None
-    cartridge: Optional[Component] = None
-    cap: Optional[Component] = None
-    quality: Quality = Quality.OK
-    packaged: bool = False
+    serial:     int
+    pen_type:   PenType                = PenType.STANDARD
+    components: Dict[str, Component]   = field(default_factory=dict)
+    quality:    Quality                = Quality.OK
+    packaged:   bool                   = False
 
     def is_complete(self) -> bool:
-        """Has every component been installed?"""
-        return all([self.barrel, self.tip, self.cartridge, self.cap])
+        return all(self.components.get(n) for n in COMPONENT_NAMES)
 
 
 # ---------------------------------------------------------------------------
-# 2. Stations: each step on the line is its own class
+# 2. Stations
 # ---------------------------------------------------------------------------
 
 class Station(ABC):
-    """Abstract base for any station on the line.
-
-    Every concrete station must implement `process`, which takes one item
-    from its input and returns the (possibly transformed) item, or None
-    if the item should be discarded (e.g., failed QC).
-    """
-
     def __init__(self, name: str, defect_rate: float = 0.0):
-        self.name = name
+        self.name        = name
         self.defect_rate = defect_rate
-        self.processed = 0
-        self.rejected = 0
+        self.processed   = 0
+        self.rejected    = 0
 
     @abstractmethod
     def process(self, item):
         ...
 
     def _maybe_defect(self) -> Quality:
-        """Helper: simulate manufacturing variance."""
-        return (
-            Quality.DEFECTIVE
-            if random.random() < self.defect_rate
-            else Quality.OK
-        )
+        return Quality.DEFECTIVE if random.random() < self.defect_rate else Quality.OK
 
     def log(self, message: str) -> None:
-        print(f"[{self.name:<18}] {message}")
+        print(f"[{self.name:<20}] {message}")
 
 
 class ComponentMaker(Station):
-    """Manufactures one type of component (barrels, tips, ...)."""
-
     def __init__(self, component_name: str, defect_rate: float = 0.05):
         super().__init__(name=f"Make {component_name}", defect_rate=defect_rate)
         self.component_name = component_name
@@ -111,8 +106,6 @@ class ComponentMaker(Station):
 
 
 class QualityControl(Station):
-    """Discards defective components before they reach assembly."""
-
     def process(self, item: Component) -> Optional[Component]:
         self.processed += 1
         if item.quality is Quality.DEFECTIVE:
@@ -124,79 +117,76 @@ class QualityControl(Station):
 
 
 class AssemblyStation(Station):
-    """Combines four good components into a single pen."""
-
     def __init__(self, defect_rate: float = 0.02):
         super().__init__(name="Assembly", defect_rate=defect_rate)
         self._counter = 0
 
-    def process(self, parts: dict) -> BallPen:
+    # pen_type defaults to STANDARD so legacy callers (hmi.py) need no change.
+    def process(self, parts: dict, pen_type: PenType = PenType.STANDARD) -> BallPen:
         self._counter += 1
         self.processed += 1
         pen = BallPen(
             serial=self._counter,
-            barrel=parts["barrel"],
-            tip=parts["tip"],
-            cartridge=parts["cartridge"],
-            cap=parts["cap"],
-            quality=self._maybe_defect(),  # assembly itself can fail
+            pen_type=pen_type,
+            components=parts,
+            quality=self._maybe_defect(),
         )
-        self.log(f"assembled Pen#{pen.serial} -> {pen.quality.name}")
+        self.log(f"assembled {pen.pen_type.value} Pen#{pen.serial} -> {pen.quality.name}")
         return pen
 
 
 class FinalInspection(Station):
-    """Final QC: a pen must be complete *and* non-defective."""
-
     def process(self, pen: BallPen) -> Optional[BallPen]:
         self.processed += 1
         if not pen.is_complete() or pen.quality is Quality.DEFECTIVE:
             self.rejected += 1
-            self.log(f"REJECT Pen#{pen.serial}")
+            self.log(f"REJECT {pen.pen_type.value} Pen#{pen.serial}")
             return None
-        self.log(f"pass   Pen#{pen.serial}")
+        self.log(f"pass   {pen.pen_type.value} Pen#{pen.serial}")
         return pen
 
 
 class Packaging(Station):
-    """Wraps the pen — the last step before shipping."""
-
     def __init__(self):
         super().__init__(name="Packaging")
 
     def process(self, pen: BallPen) -> BallPen:
         self.processed += 1
         pen.packaged = True
-        self.log(f"packaged Pen#{pen.serial}")
+        self.log(f"packaged {pen.pen_type.value} Pen#{pen.serial}")
         return pen
 
 
 # ---------------------------------------------------------------------------
-# 3. The production line: orchestrates the stations
+# 3. Production line
 # ---------------------------------------------------------------------------
 
 class ProductionLine:
-    """Runs the whole line for a target number of pens."""
+    """Orchestrates one variant's production stations."""
 
-    COMPONENT_NAMES = ("barrel", "tip", "cartridge", "cap")
+    # Class-level tuple kept for hmi.py backward compat.
+    COMPONENT_NAMES = COMPONENT_NAMES
 
-    def __init__(self):
-        # One maker + one QC per component
-        self.makers = {n: ComponentMaker(n) for n in self.COMPONENT_NAMES}
-        self.qcs = {n: QualityControl(name=f"QC {n}") for n in self.COMPONENT_NAMES}
-        # Queues hold *good* components waiting for assembly
-        self.bins: dict[str, Deque[Component]] = {
+    def __init__(self, pen_type: PenType = PenType.STANDARD):
+        self.pen_type = pen_type
+
+        tip_rate = TIP_DEFECT_RATE[pen_type]
+        self.makers: Dict[str, ComponentMaker] = {
+            n: ComponentMaker(n, defect_rate=(tip_rate if n == "tip" else 0.05))
+            for n in self.COMPONENT_NAMES
+        }
+        self.qcs: Dict[str, QualityControl] = {
+            n: QualityControl(name=f"QC {n}") for n in self.COMPONENT_NAMES
+        }
+        self.bins: Dict[str, Deque[Component]] = {
             n: deque() for n in self.COMPONENT_NAMES
         }
-        self.assembly = AssemblyStation()
-        self.final_qc = FinalInspection(name="Final QC")
+        self.assembly  = AssemblyStation()
+        self.final_qc  = FinalInspection(name="Final QC")
         self.packaging = Packaging()
-        self.shipped: List[BallPen] = []
-
-    # -- internal helpers ----------------------------------------------------
+        self.shipped:  List[BallPen] = []
 
     def _refill_bins(self) -> None:
-        """Make + inspect components until each bin has at least one."""
         for name in self.COMPONENT_NAMES:
             while not self.bins[name]:
                 raw = self.makers[name].process()
@@ -206,17 +196,14 @@ class ProductionLine:
 
     def _assemble_one(self) -> Optional[BallPen]:
         parts = {n: self.bins[n].popleft() for n in self.COMPONENT_NAMES}
-        pen = self.assembly.process(parts)
-        pen = self.final_qc.process(pen)
+        pen   = self.assembly.process(parts, self.pen_type)
+        pen   = self.final_qc.process(pen)
         if pen is None:
             return None
         return self.packaging.process(pen)
 
-    # -- public API ----------------------------------------------------------
-
     def run(self, target: int) -> None:
-        """Produce `target` shippable pens."""
-        print(f"\n=== Starting production: target = {target} pens ===\n")
+        print(f"\n=== {self.pen_type.value} Pen: target = {target} ===\n")
         while len(self.shipped) < target:
             self._refill_bins()
             pen = self._assemble_one()
@@ -225,19 +212,14 @@ class ProductionLine:
         self._report()
 
     def _report(self) -> None:
-        print("\n=== Production report ===")
-        all_stations: list[Station] = [
-            *self.makers.values(),
-            *self.qcs.values(),
-            self.assembly,
-            self.final_qc,
-            self.packaging,
+        print(f"\n=== {self.pen_type.value} Pen — Production Report ===")
+        stations: List[Station] = [
+            *self.makers.values(), *self.qcs.values(),
+            self.assembly, self.final_qc, self.packaging,
         ]
-        for s in all_stations:
-            print(
-                f"{s.name:<18} processed={s.processed:<4} rejected={s.rejected}"
-            )
-        print(f"\nShipped pens: {len(self.shipped)}")
+        for s in stations:
+            print(f"  {s.name:<20} processed={s.processed:<4} rejected={s.rejected}")
+        print(f"\n  Shipped: {len(self.shipped)}")
 
 
 # ---------------------------------------------------------------------------
@@ -245,5 +227,7 @@ class ProductionLine:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    random.seed(42)  # reproducible classroom output
-    ProductionLine().run(target=5)
+    random.seed(42)
+    ProductionLine(PenType.STANDARD).run(target=5)
+    random.seed(42)
+    ProductionLine(PenType.PREMIUM).run(target=5)
