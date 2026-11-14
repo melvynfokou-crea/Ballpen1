@@ -15,6 +15,7 @@ Backward-compatible with hmi.py:
 from __future__ import annotations
 
 import random
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
@@ -48,18 +49,26 @@ TIP_DEFECT_RATE: Dict[PenType, float] = {
 
 @dataclass
 class Component:
-    name:    str
-    serial:  int
-    quality: Quality = Quality.OK
+    name:      str
+    serial:    int
+    quality:   Quality = Quality.OK
+    # Traceability — which part variant this is, which machine made it, and when.
+    variant:   str     = ""
+    machine:   str     = ""
+    timestamp: float   = field(default_factory=time.time)
 
 
 @dataclass
 class BallPen:
-    serial:     int
-    pen_type:   PenType                = PenType.STANDARD
-    components: Dict[str, Component]   = field(default_factory=dict)
-    quality:    Quality                = Quality.OK
-    packaged:   bool                   = False
+    serial:       int
+    pen_type:     PenType                = PenType.STANDARD
+    components:   Dict[str, Component]   = field(default_factory=dict)
+    quality:      Quality                = Quality.OK
+    packaged:     bool                   = False
+    # Traceability — which work order this pen was built under, and when.
+    order_number: int                    = 0
+    order_name:   str                    = ""
+    timestamp:    float                  = field(default_factory=time.time)
 
     def is_complete(self) -> bool:
         return all(self.components.get(n) for n in COMPONENT_NAMES)
@@ -88,9 +97,12 @@ class Station(ABC):
 
 
 class ComponentMaker(Station):
-    def __init__(self, component_name: str, defect_rate: float = 0.05):
+    def __init__(self, component_name: str, defect_rate: float = 0.05,
+                 variant: str = "", machine_id: str = ""):
         super().__init__(name=f"Make {component_name}", defect_rate=defect_rate)
         self.component_name = component_name
+        self.variant        = variant
+        self.machine_id      = machine_id or f"MKR-{component_name.upper()}-1"
         self._counter = 0
 
     def process(self, _ignored=None) -> Component:
@@ -100,6 +112,9 @@ class ComponentMaker(Station):
             name=self.component_name,
             serial=self._counter,
             quality=self._maybe_defect(),
+            variant=self.variant,
+            machine=self.machine_id,
+            timestamp=time.time(),
         )
         self.log(f"produced {part.name}#{part.serial} -> {part.quality.name}")
         return part
@@ -122,7 +137,8 @@ class AssemblyStation(Station):
         self._counter = 0
 
     # pen_type defaults to STANDARD so legacy callers (hmi.py) need no change.
-    def process(self, parts: dict, pen_type: PenType = PenType.STANDARD) -> BallPen:
+    def process(self, parts: dict, pen_type: PenType = PenType.STANDARD,
+                order_number: int = 0, order_name: str = "") -> BallPen:
         self._counter += 1
         self.processed += 1
         pen = BallPen(
@@ -130,6 +146,9 @@ class AssemblyStation(Station):
             pen_type=pen_type,
             components=parts,
             quality=self._maybe_defect(),
+            order_number=order_number,
+            order_name=order_name or pen_type.value,
+            timestamp=time.time(),
         )
         self.log(f"assembled {pen.pen_type.value} Pen#{pen.serial} -> {pen.quality.name}")
         return pen
@@ -167,12 +186,25 @@ class ProductionLine:
     # Class-level tuple kept for hmi.py backward compat.
     COMPONENT_NAMES = COMPONENT_NAMES
 
-    def __init__(self, pen_type: PenType = PenType.STANDARD):
-        self.pen_type = pen_type
+    def __init__(self, pen_type: PenType = PenType.STANDARD,
+                 order_number: int = 0, order_name: str = "",
+                 part_variants: Optional[Dict[str, str]] = None,
+                 defect_multipliers: Optional[Dict[str, float]] = None):
+        self.pen_type     = pen_type
+        self.order_number = order_number
+        self.order_name   = order_name or pen_type.value
+
+        part_variants      = part_variants or {}
+        defect_multipliers = defect_multipliers or {}
 
         tip_rate = TIP_DEFECT_RATE[pen_type]
         self.makers: Dict[str, ComponentMaker] = {
-            n: ComponentMaker(n, defect_rate=(tip_rate if n == "tip" else 0.05))
+            n: ComponentMaker(
+                n,
+                defect_rate=(tip_rate if n == "tip" else 0.05) * defect_multipliers.get(n, 1.0),
+                variant=part_variants.get(n, ""),
+                machine_id=f"MKR-{n.upper()}-{order_number or 1}",
+            )
             for n in self.COMPONENT_NAMES
         }
         self.qcs: Dict[str, QualityControl] = {
@@ -196,7 +228,7 @@ class ProductionLine:
 
     def _assemble_one(self) -> Optional[BallPen]:
         parts = {n: self.bins[n].popleft() for n in self.COMPONENT_NAMES}
-        pen   = self.assembly.process(parts, self.pen_type)
+        pen   = self.assembly.process(parts, self.pen_type, self.order_number, self.order_name)
         pen   = self.final_qc.process(pen)
         if pen is None:
             return None

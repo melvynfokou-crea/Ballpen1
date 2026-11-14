@@ -1,18 +1,20 @@
 """
 mes.py
 ======
-MES data layer — tracks production targets and live counters for each pen type.
+MES data layer — tracks production targets, live counters, and genealogy
+/ traceability records for each configured work order.
 
 Used by mes_hmi.py (production threads write via record_*; UI reads for display).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Dict
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List
 
-from prod import PenType
+from prod import BallPen
+from work_orders import WorkOrder
 
 
 class LineStatus(Enum):
@@ -24,10 +26,13 @@ class LineStatus(Enum):
 
 @dataclass
 class LineData:
-    target:   int        = 0
-    produced: int        = 0
-    rejected: int        = 0
-    status:   LineStatus = LineStatus.IDLE
+    order_number: int        = 0
+    name:         str        = ""
+    target:       int        = 0
+    produced:     int        = 0
+    rejected:     int        = 0
+    status:       LineStatus = LineStatus.IDLE
+    parts:        Dict[str, str] = field(default_factory=dict)
 
     def yield_pct(self) -> float:
         total = self.produced + self.rejected
@@ -41,50 +46,52 @@ class MES:
     """Central MES state — written from production threads, read from UI thread."""
 
     def __init__(self) -> None:
-        self.lines: Dict[PenType, LineData] = {
-            PenType.STANDARD: LineData(),
-            PenType.PREMIUM:  LineData(),
-        }
+        self.lines: Dict[int, LineData] = {}
+        self.genealogy: List[BallPen] = []
 
     # ── Configuration ─────────────────────────────────────────────────────────
 
-    def set_targets(self, standard: int, premium: int) -> None:
-        self.lines[PenType.STANDARD].target = standard
-        self.lines[PenType.PREMIUM].target  = premium
+    def configure(self, work_orders: List[WorkOrder]) -> None:
+        """(Re)configure the set of work orders tracked by the MES."""
+        self.lines = {
+            wo.order_number: LineData(
+                order_number=wo.order_number, name=wo.name,
+                target=wo.quantity, parts=dict(wo.parts),
+            )
+            for wo in work_orders
+        }
 
-    def set_target(self, pen_type: PenType, target: int) -> None:
-        self.lines[pen_type].target = target
+    def set_target(self, order_number: int, target: int) -> None:
+        self.lines[order_number].target = target
 
-    def reset(self) -> None:
-        for d in self.lines.values():
-            d.produced = 0
-            d.rejected = 0
-            d.status   = LineStatus.IDLE
-
-    def reset_line(self, pen_type: PenType) -> None:
-        d = self.lines[pen_type]
+    def reset_line(self, order_number: int) -> None:
+        d = self.lines[order_number]
         d.produced = 0
         d.rejected = 0
         d.status   = LineStatus.IDLE
 
     # ── Called from production threads ────────────────────────────────────────
 
-    def record_produced(self, pen_type: PenType) -> bool:
+    def record_produced(self, order_number: int) -> bool:
         """Increment produced count.  Returns True if target is now met."""
-        d = self.lines[pen_type]
+        d = self.lines[order_number]
         d.produced += 1
         if d.target_met():
             d.status = LineStatus.DONE
             return True
         return False
 
-    def record_rejected(self, pen_type: PenType) -> None:
-        self.lines[pen_type].rejected += 1
+    def record_rejected(self, order_number: int) -> None:
+        self.lines[order_number].rejected += 1
 
-    def set_status(self, pen_type: PenType, status: LineStatus) -> None:
-        self.lines[pen_type].status = status
+    def set_status(self, order_number: int, status: LineStatus) -> None:
+        self.lines[order_number].status = status
+
+    def record_genealogy(self, pen: BallPen) -> None:
+        """Record a shipped pen and its four traced components."""
+        self.genealogy.append(pen)
 
     # ── Convenience reads ─────────────────────────────────────────────────────
 
-    def data(self, pen_type: PenType) -> LineData:
-        return self.lines[pen_type]
+    def data(self, order_number: int) -> LineData:
+        return self.lines[order_number]

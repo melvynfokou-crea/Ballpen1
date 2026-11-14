@@ -1,14 +1,28 @@
 """
 mes_hmi.py
 ==========
-MES HMI — tracks Standard (regular tip) and Premium (premium tip) pen lines.
+MES HMI — the single Ball Pen HMI window, with one physical production
+line fed by a queue of configurable work orders. Each work order has its
+own choice of parts (e.g. a "Golden Pen" order built from a Golden Barrel
+/ Golden Tip / Golden Cartridge / Golden Cap, next to a "Regular Pen"
+order built from standard parts) and its own quantity target. Orders run
+one at a time, in queue order — the line always shows what it's building
+now and what's queued up next.
 
 Features:
-  - Input fields to set the production target for each pen type
-  - Two animated pipeline diagrams, one per line
-  - Live counters: produced / target, rejected, yield %
-  - Shared rejection log with pen-type column
-  - START runs both lines in parallel; STOP halts both
+  - Work Order Setup dialog: choose how many work orders to queue, name
+    each one, set its quantity, and pick the parts (barrel / tip /
+    cartridge / cap) it is built from. Part combinations can be saved as
+    a named recipe (e.g. "Golden Pen") and reloaded into any future order.
+  - One animated pipeline + live counters for the single production line,
+    plus a "Next Order" preview of what the queue will run next.
+  - START / STOP the queue; a finished order auto-advances to the next
+    queued one.
+  - Shared rejection (NG) log across all work orders.
+  - Genealogy & Traceability log: every shipped pen's 4 components
+    (barrel, tip, cartridge, cap), each with its part variant, the
+    machine that made it, a timestamp, and the work-order number it was
+    built under.
 
 Run:
     python mes_hmi.py
@@ -17,11 +31,15 @@ Run:
 from __future__ import annotations
 
 import os, queue, sys, threading, time, tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 
 sys.path.insert(0, os.path.dirname(__file__))
-from prod import ProductionLine, PenType, Quality
+from prod import ProductionLine, PenType, BallPen
 from mes  import MES, LineStatus
+from work_orders import (
+    WorkOrder, COMPONENT_NAMES, PART_CATALOG, DEFAULT_PARTS,
+    load_presets, save_preset, default_work_orders,
+)
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
 BG     = "#1a2332"
@@ -35,12 +53,6 @@ FG     = "#e0e8f0"
 FG_DIM = "#7a8fa8"
 HEADER = "#0d1b2a"
 
-TYPE_ACCENT = {PenType.STANDARD: ACCENT, PenType.PREMIUM: PURPLE}
-TYPE_LABEL  = {
-    PenType.STANDARD: "STANDARD PEN  —  Regular Tip",
-    PenType.PREMIUM:  "PREMIUM PEN   —  Premium Tip",
-}
-
 COMP_COLORS = {
     "barrel":    "#3498db",
     "tip":       "#9b59b6",
@@ -48,6 +60,8 @@ COMP_COLORS = {
     "cap":       "#e74c3c",
     "pen":       "#f39c12",
 }
+
+MAX_ORDERS = 6
 
 # ── Pipeline geometry (mirrors hmi.py) ─────────────────────────────────────────
 _CW,  _CH    = 650, 168
@@ -72,9 +86,15 @@ EVT_STOPPED   = "stopped"
 class InstrumentedLine(ProductionLine):
     """ProductionLine that posts UI events, stops when the target is met."""
 
-    def __init__(self, pen_type: PenType, target: int,
+    def __init__(self, work_order: WorkOrder, target: int,
                  event_q: queue.Queue, stop_event: threading.Event, mes: MES):
-        super().__init__(pen_type=pen_type)
+        super().__init__(
+            pen_type=PenType.STANDARD,
+            order_number=work_order.order_number,
+            order_name=work_order.name,
+            part_variants=work_order.parts,
+            defect_multipliers=work_order.multipliers(),
+        )
         self._target = target
         self._q      = event_q
         self._stop   = stop_event
@@ -84,7 +104,7 @@ class InstrumentedLine(ProductionLine):
 
     def _stage(self, key: str, comp: str) -> None:
         if not self._stop.is_set():
-            self._q.put({"type": EVT_STAGE, "pen_type": self.pen_type,
+            self._q.put({"type": EVT_STAGE, "order_number": self.order_number,
                          "stage": key, "component": comp})
             time.sleep(STEP_DELAY)
 
@@ -100,13 +120,14 @@ class InstrumentedLine(ProductionLine):
                 inspected = self.qcs[name].process(raw)
 
                 if inspected is None:
-                    self._mes.record_rejected(self.pen_type)
+                    self._mes.record_rejected(self.order_number)
                     self._q.put({
-                        "type":     EVT_REJECTED,
-                        "pen_type": self.pen_type,
-                        "item":     f"{name.capitalize()} #{raw.serial}",
-                        "station":  f"QC – {name}",
-                        "reason":   "Defective component",
+                        "type":         EVT_REJECTED,
+                        "order_number": self.order_number,
+                        "order_name":   self.order_name,
+                        "item":         f"{name.capitalize()} #{raw.serial}",
+                        "station":      f"QC – {name}",
+                        "reason":       "Defective component",
                     })
                 else:
                     self._stage(f"bin_{name}", name)
@@ -118,26 +139,27 @@ class InstrumentedLine(ProductionLine):
 
         self._stage("assembly", "pen")
         parts  = {n: self.bins[n].popleft() for n in self.COMPONENT_NAMES}
-        pen    = self.assembly.process(parts, self.pen_type)
+        pen    = self.assembly.process(parts, self.pen_type, self.order_number, self.order_name)
 
         self._stage("final_qc", "pen")
         pen_ok = self.final_qc.process(pen)
         if pen_ok is None:
-            self._mes.record_rejected(self.pen_type)
+            self._mes.record_rejected(self.order_number)
             self._q.put({
-                "type":     EVT_REJECTED,
-                "pen_type": self.pen_type,
-                "item":     f"{self.pen_type.value} Pen #{pen.serial}",
-                "station":  "Final QC",
-                "reason":   "Assembly defect",
+                "type":         EVT_REJECTED,
+                "order_number": self.order_number,
+                "order_name":   self.order_name,
+                "item":         f"{self.order_name} Pen #{pen.serial}",
+                "station":      "Final QC",
+                "reason":       "Assembly defect",
             })
             return None
 
         self._stage("packaging", "pen")
         result = self.packaging.process(pen_ok)
-        target_met = self._mes.record_produced(self.pen_type)
-        self._q.put({"type": EVT_ASSEMBLED, "pen_type": self.pen_type,
-                     "serial": result.serial})
+        self._mes.record_genealogy(result)
+        target_met = self._mes.record_produced(self.order_number)
+        self._q.put({"type": EVT_ASSEMBLED, "order_number": self.order_number, "pen": result})
 
         self._stage("shipped", "pen")
         return result, target_met
@@ -145,8 +167,8 @@ class InstrumentedLine(ProductionLine):
     # main loop ────────────────────────────────────────────────────────────────
 
     def run_until_done(self) -> None:
-        self._mes.set_status(self.pen_type, LineStatus.RUNNING)
-        self._q.put({"type": EVT_STATUS, "pen_type": self.pen_type,
+        self._mes.set_status(self.order_number, LineStatus.RUNNING)
+        self._q.put({"type": EVT_STATUS, "order_number": self.order_number,
                      "msg": LineStatus.RUNNING.value})
 
         while not self._stop.is_set() and len(self.shipped) < self._target:
@@ -164,63 +186,56 @@ class InstrumentedLine(ProductionLine):
             final_status = LineStatus.DONE
         else:
             final_status = LineStatus.STOPPED
-            self._mes.set_status(self.pen_type, final_status)
+            self._mes.set_status(self.order_number, final_status)
 
-        self._q.put({"type": EVT_STATUS, "pen_type": self.pen_type,
+        self._q.put({"type": EVT_STATUS, "order_number": self.order_number,
                      "msg": f"{final_status.value}  —  {len(self.shipped)} shipped"})
-        self._q.put({"type": EVT_STOPPED, "pen_type": self.pen_type})
+        self._q.put({"type": EVT_STOPPED, "order_number": self.order_number})
 
 
-# ── Single-line panel ──────────────────────────────────────────────────────────
+# ── The single production line panel ────────────────────────────────────────────
 
-class LinePanel(tk.LabelFrame):
-    """Displays one production line: target input, pipeline, live stats."""
+class ProductionLinePanel(tk.LabelFrame):
+    """The one physical line: current order, its pipeline/stats, and a
+    preview of the next order waiting in the queue."""
 
-    def __init__(self, parent: tk.Widget, pen_type: PenType,
-                 shared_q: queue.Queue, mes: MES):
-        accent = TYPE_ACCENT[pen_type]
+    def __init__(self, parent: tk.Widget, on_start, on_stop):
         super().__init__(
             parent,
-            text=f"  {TYPE_LABEL[pen_type]}  ",
-            bg=BG, fg=accent,
+            text="  PRODUCTION LINE  ",
+            bg=BG, fg=ACCENT,
             font=("Courier New", 11, "bold"),
             bd=2, relief="ridge", labelanchor="n",
             padx=8, pady=6,
         )
-        self._pen_type = pen_type
-        self._mes      = mes
-        self._shared_q = shared_q
+        self._on_start = on_start
+        self._on_stop  = on_stop
 
-        self._stop_event:   threading.Event        = threading.Event()
-        self._thread:       threading.Thread | None = None
-        self._active_stage: str | None             = None
-        self._stage_items:  dict[str, tuple]       = {}
+        self._active_stage: str | None       = None
+        self._stage_items:  dict[str, tuple] = {}
 
         self._build()
 
     # ── UI construction ────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        accent = TYPE_ACCENT[self._pen_type]
+        # Current order header
+        cur = tk.Frame(self, bg=BG)
+        cur.pack(fill="x")
+        tk.Label(cur, text="Current Order:", bg=BG, fg=FG,
+                 font=("Courier New", 10, "bold")).pack(side="left")
+        self._current_name_var = tk.StringVar(value="— idle —")
+        tk.Label(cur, textvariable=self._current_name_var, bg=BG, fg=ACCENT,
+                 font=("Courier New", 10, "bold")).pack(side="left", padx=6)
+        tk.Label(cur, text="Target:", bg=BG, fg=FG,
+                 font=("Courier New", 10)).pack(side="left", padx=(16, 0))
+        self._target_val_var = tk.StringVar(value="—")
+        tk.Label(cur, textvariable=self._target_val_var, bg=BG, fg=ACCENT,
+                 font=("Courier New", 10, "bold")).pack(side="left", padx=6)
 
-        # Target input row
-        row = tk.Frame(self, bg=BG)
-        row.pack(fill="x", pady=(0, 6))
-
-        tk.Label(row, text="Target:", bg=BG, fg=FG,
-                 font=("Courier New", 10)).pack(side="left")
-
-        self._target_var = tk.StringVar(value="10")
-        self._target_entry = tk.Entry(
-            row, textvariable=self._target_var, width=6,
-            bg=PANEL, fg=accent, insertbackground=accent,
-            font=("Courier New", 12, "bold"),
-            relief="flat", bd=4, justify="center",
-        )
-        self._target_entry.pack(side="left", padx=6)
-
-        tk.Label(row, text="pens", bg=BG, fg=FG_DIM,
-                 font=("Courier New", 10)).pack(side="left")
+        self._current_parts_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._current_parts_var, bg=BG, fg=FG_DIM,
+                 font=("Courier New", 8)).pack(fill="x", pady=(0, 6))
 
         # Pipeline canvas
         self._build_pipeline()
@@ -245,9 +260,9 @@ class LinePanel(tk.LabelFrame):
                  bg=PANEL, fg=RED, font=("Courier New", 9)).grid(row=0, column=2, padx=6)
 
         tk.Label(stats, textvariable=self._yield_var,
-                 bg=PANEL, fg=accent, font=("Courier New", 9)).grid(row=0, column=3, padx=6)
+                 bg=PANEL, fg=ACCENT, font=("Courier New", 9)).grid(row=0, column=3, padx=6)
 
-        # Per-line start / stop buttons
+        # Queue start / stop buttons
         btn_row = tk.Frame(self, bg=BG, pady=6)
         btn_row.pack()
 
@@ -256,7 +271,7 @@ class LinePanel(tk.LabelFrame):
             bg=GREEN, fg="#000", activebackground="#22a844",
             font=("Courier New", 10, "bold"),
             width=10, relief="flat", cursor="hand2",
-            command=self.start,
+            command=self._on_start,
         )
         self._btn_start.pack(side="left", padx=6)
 
@@ -266,9 +281,23 @@ class LinePanel(tk.LabelFrame):
             font=("Courier New", 10, "bold"),
             width=10, relief="flat", cursor="hand2",
             state="disabled",
-            command=self.stop,
+            command=self._on_stop,
         )
         self._btn_stop.pack(side="left", padx=6)
+
+        # Next order preview
+        nxt = tk.Frame(self, bg=PANEL, padx=10, pady=6)
+        nxt.pack(fill="x", pady=(8, 0))
+
+        tk.Label(nxt, text="NEXT ORDER:", bg=PANEL, fg=FG_DIM,
+                 font=("Courier New", 9, "bold")).grid(row=0, column=0, sticky="w")
+        self._next_name_var = tk.StringVar(value="— none queued —")
+        tk.Label(nxt, textvariable=self._next_name_var, bg=PANEL, fg=AMBER,
+                 font=("Courier New", 9, "bold")).grid(row=0, column=1, padx=8, sticky="w")
+        self._next_parts_var = tk.StringVar(value="")
+        tk.Label(nxt, textvariable=self._next_parts_var, bg=PANEL, fg=FG_DIM,
+                 font=("Courier New", 8)).grid(row=1, column=0, columnspan=2,
+                                                sticky="w", pady=(2, 0))
 
     def _build_pipeline(self) -> None:
         c = tk.Canvas(self, bg=PANEL, width=_CW, height=_CH, highlightthickness=0)
@@ -307,46 +336,48 @@ class LinePanel(tk.LabelFrame):
         arrow(_X_FQC  + _BHW, _CTR_Y, _X_PACK - _BHW, _CTR_Y)
         arrow(_X_PACK + _BHW, _CTR_Y, _X_SHIP - _BHW, _CTR_Y)
 
-    # ── Per-line controls ─────────────────────────────────────────────────────
+    # ── Order transitions ──────────────────────────────────────────────────────
 
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        try:
-            target = self.get_target()
-            if target <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Invalid input",
-                                 "Target must be a positive integer.", parent=self)
-            return
-
-        self._mes.reset_line(self._pen_type)
-        self._mes.set_target(self._pen_type, target)
-        self._stop_event.clear()
+    def begin_order(self, work_order: WorkOrder) -> None:
+        self._current_name_var.set(f"{work_order.name}   (Order #{work_order.order_number})")
+        self._current_parts_var.set(work_order.parts_summary())
+        self._target_val_var.set(str(work_order.quantity))
         self.reset_pipeline()
-        self.refresh()
-        self.lock_input(True)
+        self._status_var.set(LineStatus.IDLE.value)
+        self._progress_var.set(f"Produced:  0 / {work_order.quantity}")
+        self._rejected_var.set("Rejected: 0")
+        self._yield_var.set("Yield: 0.0 %")
+        self.enable_stop(True)
 
-        line = InstrumentedLine(
-            self._pen_type, target,
-            self._shared_q, self._stop_event, self._mes,
-        )
-        self._thread = threading.Thread(target=line.run_until_done, daemon=True)
-        self._thread.start()
-        self._btn_start.config(state="disabled")
-        self._btn_stop.config(state="normal")
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        self._btn_stop.config(state="disabled")
-
-    def on_stopped(self) -> None:
+    def show_idle(self) -> None:
+        self._current_name_var.set("— idle —")
+        self._current_parts_var.set("")
+        self._target_val_var.set("—")
         self.reset_pipeline()
-        self.refresh()
-        self.lock_input(False)
-        self._btn_start.config(state="normal")
-        self._btn_stop.config(state="disabled")
+        self._status_var.set(LineStatus.IDLE.value)
+        self._progress_var.set("Produced:  0 / 0")
+        self._rejected_var.set("Rejected: 0")
+        self._yield_var.set("Yield: 0.0 %")
+        self.enable_stop(False)
+
+    def show_queue_complete(self) -> None:
+        self._current_name_var.set("✓ Queue complete")
+        self.reset_pipeline()
+        self.enable_stop(False)
+
+    def set_next(self, work_order: WorkOrder | None) -> None:
+        if work_order is None:
+            self._next_name_var.set("— none queued —")
+            self._next_parts_var.set("")
+        else:
+            self._next_name_var.set(f"{work_order.name}   (Order #{work_order.order_number})")
+            self._next_parts_var.set(work_order.parts_summary())
+
+    def enable_start(self, on: bool) -> None:
+        self._btn_start.config(state="normal" if on else "disabled")
+
+    def enable_stop(self, on: bool) -> None:
+        self._btn_stop.config(state="normal" if on else "disabled")
 
     # ── Stage highlighting ─────────────────────────────────────────────────────
 
@@ -371,23 +402,196 @@ class LinePanel(tk.LabelFrame):
 
     # ── Live display update ────────────────────────────────────────────────────
 
-    def refresh(self) -> None:
-        d = self._mes.data(self._pen_type)
-        self._status_var.set(d.status.value)
-        self._progress_var.set(f"Produced:  {d.produced} / {d.target}")
-        self._rejected_var.set(f"Rejected: {d.rejected}")
-        self._yield_var.set(f"Yield: {d.yield_pct()} %")
+    def refresh(self, line_data) -> None:
+        self._status_var.set(line_data.status.value)
+        self._progress_var.set(f"Produced:  {line_data.produced} / {line_data.target}")
+        self._rejected_var.set(f"Rejected: {line_data.rejected}")
+        self._yield_var.set(f"Yield: {line_data.yield_pct()} %")
 
     def set_status_text(self, msg: str) -> None:
         self._status_var.set(msg)
 
-    # ── Target input ──────────────────────────────────────────────────────────
 
-    def get_target(self) -> int:
-        return int(self._target_var.get())
+# ── Work-order configuration row / dialog ───────────────────────────────────────
 
-    def lock_input(self, locked: bool) -> None:
-        self._target_entry.config(state="disabled" if locked else "normal")
+class OrderRow:
+    """One editable row inside the Work Order Setup dialog."""
+
+    def __init__(self, parent: tk.Widget, index: int, work_order: WorkOrder,
+                 preset_names: list[str], on_preset_saved):
+        self._on_preset_saved = on_preset_saved
+
+        self.frame = tk.Frame(parent, bg=PANEL, pady=4)
+        self.frame.pack(fill="x", pady=2)
+
+        tk.Label(self.frame, text=f"#{index}", bg=PANEL, fg=FG_DIM, width=3,
+                 font=("Courier New", 9, "bold")).grid(row=0, column=0, padx=3)
+
+        self.name_var = tk.StringVar(value=work_order.name)
+        tk.Entry(self.frame, textvariable=self.name_var, width=14,
+                 bg=BG, fg=FG, insertbackground=FG, relief="flat",
+                 font=("Courier New", 9)).grid(row=0, column=1, padx=3)
+
+        self.qty_var = tk.StringVar(value=str(work_order.quantity))
+        tk.Entry(self.frame, textvariable=self.qty_var, width=5, justify="center",
+                 bg=BG, fg=FG, insertbackground=FG, relief="flat",
+                 font=("Courier New", 9)).grid(row=0, column=2, padx=3)
+
+        self.part_vars: dict[str, tk.StringVar] = {}
+        col = 3
+        for comp in COMPONENT_NAMES:
+            var = tk.StringVar(value=work_order.part(comp))
+            ttk.Combobox(self.frame, textvariable=var, width=17, state="readonly",
+                         values=list(PART_CATALOG[comp].keys()),
+                         font=("Courier New", 9)).grid(row=0, column=col, padx=2)
+            self.part_vars[comp] = var
+            col += 1
+
+        self.preset_var = tk.StringVar()
+        self.preset_box = ttk.Combobox(self.frame, textvariable=self.preset_var, width=13,
+                                        state="readonly", values=preset_names,
+                                        font=("Courier New", 9))
+        self.preset_box.grid(row=0, column=col, padx=(8, 2)); col += 1
+
+        tk.Button(self.frame, text="Load", command=self._load_preset,
+                   bg=ACCENT, fg="#000", font=("Courier New", 8, "bold"),
+                   relief="flat", width=5).grid(row=0, column=col, padx=2); col += 1
+
+        tk.Button(self.frame, text="Save As…", command=self._save_preset,
+                   bg=AMBER, fg="#000", font=("Courier New", 8, "bold"),
+                   relief="flat", width=8).grid(row=0, column=col, padx=2)
+
+    def _load_preset(self) -> None:
+        name = self.preset_var.get()
+        if not name:
+            return
+        parts = load_presets().get(name)
+        if not parts:
+            return
+        for comp, var in self.part_vars.items():
+            var.set(parts.get(comp, DEFAULT_PARTS[comp]))
+
+    def _save_preset(self) -> None:
+        name = simpledialog.askstring(
+            "Save combination",
+            "Name for this parts combination\n(e.g. \"Premium Pen\"):",
+            parent=self.frame,
+        )
+        if not name:
+            return
+        parts = {c: v.get() for c, v in self.part_vars.items()}
+        save_preset(name, parts)
+        self._on_preset_saved()
+
+    def set_preset_names(self, names: list[str]) -> None:
+        self.preset_box.configure(values=names)
+
+    def to_work_order(self, order_number: int) -> WorkOrder:
+        name = self.name_var.get().strip() or f"Order {order_number}"
+        try:
+            qty = int(self.qty_var.get())
+        except ValueError:
+            qty = 0
+        parts = {c: v.get() for c, v in self.part_vars.items()}
+        return WorkOrder(order_number, name, qty, parts)
+
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+
+class WorkOrderDialog(tk.Toplevel):
+    """Lets the user choose how many work orders to run and configure each."""
+
+    def __init__(self, parent: tk.Widget, work_orders: list[WorkOrder], on_apply):
+        super().__init__(parent)
+        self.title("Configure Work Orders")
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.grab_set()
+        self._on_apply = on_apply
+        self._rows: list[OrderRow] = []
+
+        tk.Label(self, text="WORK ORDER SETUP", bg=BG, fg=ACCENT,
+                 font=("Courier New", 12, "bold")).pack(pady=(10, 2))
+        tk.Label(self, text="Choose how many work orders to produce, name each one,\n"
+                             "set its quantity, and pick the parts it is built from.",
+                 bg=BG, fg=FG_DIM, font=("Courier New", 8)).pack(pady=(0, 8))
+
+        count_row = tk.Frame(self, bg=BG)
+        count_row.pack(pady=(0, 8))
+        tk.Label(count_row, text="Number of work orders:", bg=BG, fg=FG,
+                 font=("Courier New", 10)).pack(side="left", padx=4)
+        self._count_var = tk.StringVar(value=str(max(1, len(work_orders))))
+        tk.Spinbox(count_row, from_=1, to=MAX_ORDERS, width=4,
+                   textvariable=self._count_var, bg=PANEL, fg=FG,
+                   font=("Courier New", 10), justify="center",
+                   command=self._resize_rows).pack(side="left", padx=4)
+        tk.Button(count_row, text="Apply Count", command=self._resize_rows,
+                  bg=ACCENT, fg="#000", font=("Courier New", 9, "bold"),
+                  relief="flat").pack(side="left", padx=8)
+
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", padx=12)
+        for i, (text, w) in enumerate([
+            ("#", 3), ("Name", 14), ("Qty", 5), ("Barrel", 17), ("Tip", 17),
+            ("Cartridge", 17), ("Cap", 17), ("Preset", 13), ("", 5), ("", 8),
+        ]):
+            tk.Label(header, text=text, bg=BG, fg=FG_DIM, width=w, anchor="w",
+                     font=("Courier New", 8, "bold")).grid(row=0, column=i, padx=2)
+
+        self._rows_frame = tk.Frame(self, bg=BG, padx=12)
+        self._rows_frame.pack(fill="both", expand=True)
+
+        for wo in (work_orders or [WorkOrder(1, "Order 1", 10, dict(DEFAULT_PARTS))]):
+            self._add_row(wo)
+
+        btn_row = tk.Frame(self, bg=BG, pady=10)
+        btn_row.pack()
+        tk.Button(btn_row, text="Apply", command=self._apply,
+                  bg=GREEN, fg="#000", font=("Courier New", 10, "bold"),
+                  width=10, relief="flat").pack(side="left", padx=6)
+        tk.Button(btn_row, text="Cancel", command=self.destroy,
+                  bg=RED, fg="#fff", font=("Courier New", 10, "bold"),
+                  width=10, relief="flat").pack(side="left", padx=6)
+
+    def _preset_names(self) -> list[str]:
+        return sorted(load_presets().keys())
+
+    def _add_row(self, work_order: WorkOrder) -> None:
+        row = OrderRow(self._rows_frame, len(self._rows) + 1, work_order,
+                        self._preset_names(), self._refresh_preset_lists)
+        self._rows.append(row)
+
+    def _refresh_preset_lists(self) -> None:
+        names = self._preset_names()
+        for row in self._rows:
+            row.set_preset_names(names)
+
+    def _resize_rows(self) -> None:
+        try:
+            n = max(1, min(MAX_ORDERS, int(self._count_var.get())))
+        except ValueError:
+            n = len(self._rows)
+        self._count_var.set(str(n))
+
+        while len(self._rows) < n:
+            idx = len(self._rows) + 1
+            self._add_row(WorkOrder(idx, f"Order {idx}", 10, dict(DEFAULT_PARTS)))
+        while len(self._rows) > n:
+            self._rows.pop().destroy()
+
+    def _apply(self) -> None:
+        work_orders = []
+        for i, row in enumerate(self._rows, start=1):
+            wo = row.to_work_order(i)
+            if wo.quantity <= 0:
+                messagebox.showerror("Invalid input",
+                                      f"Order #{i} ({wo.name}) needs a positive quantity.",
+                                      parent=self)
+                return
+            work_orders.append(wo)
+        self._on_apply(work_orders)
+        self.destroy()
 
 
 # ── Main MES HMI window ────────────────────────────────────────────────────────
@@ -401,9 +605,17 @@ class MesHMI(tk.Tk):
         self.resizable(False, False)
 
         self._mes      = MES()
-        self._shared_q = queue.Queue()
+        self._shared_q: queue.Queue = queue.Queue()
+        self._work_orders: list[WorkOrder] = default_work_orders()
+        self._mes.configure(self._work_orders)
+
+        self._pending:    list[WorkOrder]       = []
+        self._current_wo: WorkOrder | None      = None
+        self._stop_event: threading.Event       = threading.Event()
+        self._thread:     threading.Thread | None = None
 
         self._build_ui()
+        self._reset_queue()
         self._poll()
 
     # ── UI construction ────────────────────────────────────────────────────────
@@ -419,33 +631,40 @@ class MesHMI(tk.Tk):
             font=("Courier New", 14, "bold"),
         ).pack()
 
-        # Line panels
+        # Work order toolbar
+        toolbar = tk.Frame(self, bg=PANEL, pady=8, padx=14)
+        toolbar.pack(fill="x")
+
+        tk.Button(toolbar, text="⚙  Configure Work Orders", command=self._open_work_order_dialog,
+                  bg=ACCENT, fg="#000", font=("Courier New", 10, "bold"),
+                  relief="flat", cursor="hand2").pack(side="left")
+
+        self._queue_summary_var = tk.StringVar(value="")
+        tk.Label(toolbar, textvariable=self._queue_summary_var, bg=PANEL, fg=FG_DIM,
+                 font=("Courier New", 9)).pack(side="left", padx=16)
+
+        # The single production line
         body = tk.Frame(self, bg=BG, padx=14, pady=10)
         body.pack(fill="x")
+        self._line_panel = ProductionLinePanel(body, self._start_queue, self._stop_queue)
+        self._line_panel.pack(fill="x")
 
-        self._std_panel = LinePanel(body, PenType.STANDARD, self._shared_q, self._mes)
-        self._std_panel.pack(fill="x", pady=(0, 10))
-
-        self._prm_panel = LinePanel(body, PenType.PREMIUM, self._shared_q, self._mes)
-        self._prm_panel.pack(fill="x")
-
-        self._panels = {
-            PenType.STANDARD: self._std_panel,
-            PenType.PREMIUM:  self._prm_panel,
-        }
-
-        # Divider
         tk.Frame(self, bg=ACCENT, height=2).pack(fill="x")
 
-        # Rejection log
+        # Rejection (NG) log
         self._build_log()
+
+        tk.Frame(self, bg=ACCENT, height=2).pack(fill="x")
+
+        # Genealogy & traceability
+        self._build_genealogy()
 
     def _build_log(self) -> None:
         log_frame = tk.Frame(self, bg=BG, padx=14, pady=8)
         log_frame.pack(fill="both", expand=True)
 
         tk.Label(
-            log_frame, text="REJECTION LOG",
+            log_frame, text="NG LOG  —  REJECTIONS",
             bg=BG, fg=FG_DIM, font=("Courier New", 9, "bold"),
         ).pack(anchor="w", pady=(0, 4))
 
@@ -462,15 +681,15 @@ class MesHMI(tk.Tk):
                   background=[("selected", ACCENT)],
                   foreground=[("selected", "#000")])
 
-        cols = ("Pen Type", "Item", "Station", "Reason")
+        cols = ("Order #", "Order", "Item", "Station", "Reason")
         wrap = tk.Frame(log_frame, bg=BG)
         wrap.pack(fill="both", expand=True)
 
         self._tree = ttk.Treeview(
             wrap, columns=cols, show="headings",
-            style="MES.Treeview", height=8,
+            style="MES.Treeview", height=7,
         )
-        for col, w in zip(cols, (110, 160, 180, 240)):
+        for col, w in zip(cols, (60, 130, 160, 170, 220)):
             self._tree.heading(col, text=col)
             self._tree.column(col, width=w, anchor="w")
 
@@ -479,39 +698,172 @@ class MesHMI(tk.Tk):
         self._tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
+    def _build_genealogy(self) -> None:
+        gen_frame = tk.Frame(self, bg=BG, padx=14, pady=8)
+        gen_frame.pack(fill="both", expand=True)
+
+        tk.Label(
+            gen_frame, text="GENEALOGY & TRACEABILITY  —  each pen's 4 traced components",
+            bg=BG, fg=FG_DIM, font=("Courier New", 9, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+
+        cols = ("Variant", "Machine", "Timestamp", "Order #")
+        wrap = tk.Frame(gen_frame, bg=BG)
+        wrap.pack(fill="both", expand=True)
+
+        self._gen_tree = ttk.Treeview(
+            wrap, columns=cols, show="tree headings",
+            style="MES.Treeview", height=9,
+        )
+        self._gen_tree.heading("#0", text="Pen / Component")
+        self._gen_tree.column("#0", width=230, anchor="w")
+        for col, w in zip(cols, (190, 150, 150, 70)):
+            self._gen_tree.heading(col, text=col)
+            self._gen_tree.column(col, width=w, anchor="w")
+
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self._gen_tree.yview)
+        self._gen_tree.configure(yscrollcommand=sb.set)
+        self._gen_tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
         tk.Frame(self, bg=BG, height=8).pack()
+
+    # ── Work order queue ───────────────────────────────────────────────────────
+
+    def _reset_queue(self) -> None:
+        self._pending    = list(self._work_orders)
+        self._current_wo = None
+        self._line_panel.show_idle()
+        self._advance_preview()
+        self._sync_start_button()
+        self._update_queue_summary()
+
+    def _advance_preview(self) -> None:
+        self._line_panel.set_next(self._pending[0] if self._pending else None)
+
+    def _update_queue_summary(self) -> None:
+        self._queue_summary_var.set(f"Queue: {len(self._pending)} order(s) pending")
+
+    def _sync_start_button(self) -> None:
+        self._line_panel.enable_start(self._current_wo is None and bool(self._pending))
+
+    def _open_work_order_dialog(self) -> None:
+        if self._current_wo is not None:
+            messagebox.showwarning(
+                "Order running",
+                "Stop the production line before reconfiguring work orders.", parent=self)
+            return
+        WorkOrderDialog(self, list(self._work_orders), self._apply_work_orders)
+
+    def _apply_work_orders(self, work_orders: list[WorkOrder]) -> None:
+        self._work_orders = work_orders
+        self._mes.configure(work_orders)
+        self._reset_queue()
+
+    def _start_queue(self) -> None:
+        if self._current_wo is not None:
+            return
+        if not self._pending:
+            messagebox.showinfo("Queue empty",
+                                 "Configure at least one work order first.", parent=self)
+            return
+        self._launch_next()
+
+    def _launch_next(self) -> None:
+        if not self._pending:
+            self._current_wo = None
+            self._line_panel.show_queue_complete()
+            self._sync_start_button()
+            self._update_queue_summary()
+            return
+
+        wo = self._pending.pop(0)
+        self._current_wo = wo
+        self._mes.reset_line(wo.order_number)
+        self._mes.set_target(wo.order_number, wo.quantity)
+        self._stop_event = threading.Event()
+
+        self._line_panel.begin_order(wo)
+        self._advance_preview()
+        self._line_panel.enable_start(False)
+        self._update_queue_summary()
+
+        line = InstrumentedLine(wo, wo.quantity, self._shared_q, self._stop_event, self._mes)
+        self._thread = threading.Thread(target=line.run_until_done, daemon=True)
+        self._thread.start()
+
+    def _stop_queue(self) -> None:
+        self._stop_event.set()
+        self._line_panel.enable_stop(False)
+
+    def _on_order_stopped(self, order_number: int) -> None:
+        if self._current_wo is None or self._current_wo.order_number != order_number:
+            return
+        status = self._mes.data(order_number).status
+        self._current_wo = None
+        self._line_panel.refresh(self._mes.data(order_number))
+
+        if status == LineStatus.DONE:
+            self._launch_next()
+        else:
+            self._sync_start_button()
+            self._update_queue_summary()
+
+    # ── Genealogy display ─────────────────────────────────────────────────────
+
+    def _insert_genealogy(self, pen: BallPen) -> None:
+        ts = time.strftime("%H:%M:%S", time.localtime(pen.timestamp))
+        parent = self._gen_tree.insert(
+            "", 0, text=f"Pen #{pen.serial}  —  {pen.order_name}",
+            values=("", "ASSEMBLY", ts, pen.order_number), open=True,
+        )
+        for name in COMPONENT_NAMES:
+            comp = pen.components.get(name)
+            if comp is None:
+                continue
+            cts = time.strftime("%H:%M:%S", time.localtime(comp.timestamp))
+            self._gen_tree.insert(
+                parent, "end", text=f"    {name.capitalize()}",
+                values=(comp.variant or "—", comp.machine, cts, pen.order_number),
+            )
+        # keep the log from growing unbounded during a long run
+        top_level = self._gen_tree.get_children("")
+        for old in top_level[200:]:
+            self._gen_tree.delete(old)
 
     # ── Event pump (UI thread, every 50 ms) ───────────────────────────────────
 
     def _poll(self) -> None:
         try:
             while True:
-                evt      = self._shared_q.get_nowait()
-                t        = evt["type"]
-                pen_type = evt.get("pen_type")
-                panel    = self._panels.get(pen_type)
+                evt          = self._shared_q.get_nowait()
+                t            = evt["type"]
+                order_number = evt.get("order_number")
+                is_current   = (self._current_wo is not None
+                                 and self._current_wo.order_number == order_number)
 
-                if t == EVT_STAGE and panel:
-                    panel.highlight_stage(evt["stage"], evt["component"])
+                if t == EVT_STAGE and is_current:
+                    self._line_panel.highlight_stage(evt["stage"], evt["component"])
 
-                elif t == EVT_STATUS and panel:
-                    panel.set_status_text(evt["msg"])
+                elif t == EVT_STATUS and is_current:
+                    self._line_panel.set_status_text(evt["msg"])
 
-                elif t == EVT_ASSEMBLED and panel:
-                    panel.refresh()
+                elif t == EVT_ASSEMBLED:
+                    if is_current:
+                        self._line_panel.refresh(self._mes.data(order_number))
+                    self._insert_genealogy(evt["pen"])
 
                 elif t == EVT_REJECTED:
-                    if panel:
-                        panel.refresh()
+                    if is_current:
+                        self._line_panel.refresh(self._mes.data(order_number))
                     self._tree.insert("", "end", values=(
-                        pen_type.value if pen_type else "?",
-                        evt["item"], evt["station"], evt["reason"],
+                        order_number if order_number is not None else "?",
+                        evt.get("order_name", "?"), evt["item"], evt["station"], evt["reason"],
                     ))
                     self._tree.yview_moveto(1.0)
 
                 elif t == EVT_STOPPED:
-                    if panel:
-                        panel.on_stopped()
+                    self._on_order_stopped(order_number)
 
         except queue.Empty:
             pass
